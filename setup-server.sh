@@ -7,12 +7,12 @@
 # The script will install the real installer to /usr/local/bin/setup-my-dns-and-logging-server.sh
 # (using sudo when needed) and make it executable.
 set -euo pipefail
-# --- Auto-fix CRLF if file accidentally downloaded with Windows line endings ---
-if grep -q $'
-' "$0"; then
+# --- CRLF auto-fix ---
+if grep -q $'\r' "$0" 2>/dev/null; then
   echo "Fixing CRLF line endings..."
-  sed -i 's/
-$//' "$0"
+  tr -d '\r' < "$0" > "${0}.fixed" || exit 1
+  mv "${0}.fixed" "$0"
+  chmod +x "$0"
   exec "$0" "$@"
 fi
 # --------------------------------------------------------------------------
