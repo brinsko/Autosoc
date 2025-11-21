@@ -1,27 +1,9 @@
+cat > /usr/local/bin/setup-my-dns-and-logging-server.sh <<'SERVER_EOF'
 #!/bin/bash
-# setup-server.sh
-# Modified wrapper: if run from any path it will install itself to
-# /usr/local/bin/setup-my-dns-and-logging-server.sh and exec that copy.
+# setup-my-dns-and-logging-server.sh
+# Wrapper (preserves your original installer) + mandatory RHEL local-repo config (BaseOS+AppStream) when RHEL-like detected.
 set -euo pipefail
 IFS=$'\n\t'
-
-# ---------- bootstrap: install self to canonical path and exec ----------
-TARGET="/usr/local/bin/setup-my-dns-and-logging-server.sh"
-SELF="$(readlink -f "$0")"
-
-# If not already running from the canonical installed path, copy and exec.
-if [ "$SELF" != "$TARGET" ]; then
-  # If we're not root, running sudo will be required to write to /usr/local/bin.
-  # Since many users run with 'sudo ./setup-server.sh ...', we still attempt the copy.
-  echo "Installing script to $TARGET and executing there..."
-  # Copy preserving permissions where possible
-  cp -f "$SELF" "$TARGET"
-  chmod 755 "$TARGET"
-  chown root:root "$TARGET" 2>/dev/null || true
-  exec "$TARGET" "$@"
-fi
-# From here on, we are running as /usr/local/bin/setup-my-dns-and-logging-server.sh
-# ------------------------------------------------------------------------------
 
 LOG=/var/log/setup-my-dns-and-logging-server.wrapper.log
 exec > >(tee -a "$LOG") 2>&1
@@ -292,7 +274,7 @@ dnf install -y rsyslog &>/dev/null || true
 mkdir -p /var/log/remote
 chmod 750 /var/log/remote
 
-cat > /etc/rsyslog.d/50-remote-logger.conf <<RSYS
+cat > /etc/rsyslog.d/50-remote-logger.conf <<'RSYS'
 module(load="imuxsock")
 module(load="imjournal")
 
@@ -416,3 +398,4 @@ chmod +x /usr/local/bin/add-client.sh
 
 echo "Server wrapper finished. See $LOG"
 exit 0
+SERVER_EOF
