@@ -25,3 +25,4 @@
     1) wget https://raw.githubusercontent.com/brinsko/Autosoc/refs/heads/main/join-client.sh && chmod +x join-client.sh && sudo ./join-client.sh && cd /usr/local/bin && chmod +x join-dns-and-enable-full-logging.sh
 
      command - /usr/local/bin/join-dns-and-enable-full-logging.sh 192.168.29.206 cst.com client1  (server ip) (domain) (client/host name)
+# WARNING: If you (or admin) block the target machine from reaching the server → it will AUTO POWER OFF in 40 seconds (first time) or just 15 seconds (next times)! ⚠️⚠️⚠️⚠️
