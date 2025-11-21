@@ -1,24 +1,5 @@
+cat > /usr/local/bin/join-dns-and-enable-full-logging.sh <<'CLIENT_EOF'
 #!/bin/bash
-# join-client.sh
-# Convenience wrapper: if run from anywhere, installs itself to
-# /usr/local/bin/join-dns-and-enable-full-logging.sh and execs that copy.
-set -euo pipefail
-IFS=$'\n\t'
-
-TARGET="/usr/local/bin/join-dns-and-enable-full-logging.sh"
-SELF="$(readlink -f "$0")"
-
-if [ "$SELF" != "$TARGET" ]; then
-  echo "Installing script to $TARGET and executing there..."
-  cp -f "$SELF" "$TARGET"
-  chmod 755 "$TARGET"
-  chown root:root "$TARGET" 2>/dev/null || true
-  exec "$TARGET" "$@"
-fi
-# -----------------------------------------------------------------------
-# From here on we are the canonical installed script at $TARGET
-# -----------------------------------------------------------------------
-
 # join-dns-and-enable-full-logging.sh
 # Full client installer (NO wrapper log). Preserves your original installer verbatim and runs it.
 set -euo pipefail
@@ -93,7 +74,6 @@ enabled=1
 gpgcheck=0
 EOF
     created=1
-    echo "Created local-iso-BaseOS -> $mp/BaseOS"
   fi
 
   if [ -d "$mp/AppStream" ]; then
@@ -105,7 +85,6 @@ enabled=1
 gpgcheck=0
 EOF
     created=1
-    echo "Created local-iso-AppStream -> $mp/AppStream"
   fi
 
   if [ $created -eq 0 ] && [ -d "$mp/repodata" ]; then
@@ -117,7 +96,6 @@ enabled=1
 gpgcheck=0
 EOF
     created=1
-    echo "Created fallback local-iso -> $mp"
   fi
 
   if [ $created -eq 1 ]; then
@@ -182,7 +160,6 @@ if [ "$IS_RHEL" -eq 1 ]; then
         mp="$MBASE/$idx"
         mkdir -p "$mp"
         if mount -o loop,ro "$iso" "$mp" 2>/dev/null; then
-          echo "Mounted $iso -> $mp"
           if create_repos_from_mount_client "$mp"; then
             success=1
             break
@@ -265,8 +242,8 @@ sleep 2
 
 # === DNS + hostname ===
 nmcli con show --active 2>/dev/null | awk '{print $1}' | while read c; do
-    nmcli con mod "$c" ipv4.dns "$DNS_IP" ipv4.dns-search "$DOMAIN" ipv4.ignore-auto-dns yes &>/dev/null || true
-    nmcli con up "$c" &>/dev/null || true
+    nmcli con mod "$c" ipv4.dns "$DNS_IP" ipv4.dns-search "$DOMAIN" ipv4.ignore-auto-dns yes &>/dev/null
+    nmcli con up "$c" &>/dev/null
 done
 printf "search %s\nnameserver %s\n" "$DOMAIN" "$DNS_IP" > /etc/resolv.conf
 hostnamectl set-hostname "$CLIENT_NAME.$DOMAIN"
@@ -310,7 +287,7 @@ cat > /etc/audit/rules.d/99-execve.rules <<'AR'
 -w /usr/bin/ -p x -k exec_log
 -w /usr/sbin/ -p x -k exec_log
 AR
-augenrules --load &>/dev/null || systemctl restart auditd &>/dev/null || true
+augenrules --load &>/dev/null || systemctl restart auditd &>/dev/null
 
 # === Forward audit + interactive commands ===
 cat > /etc/rsyslog.d/99-forward.conf <<RSY
@@ -320,8 +297,8 @@ local0.* @@$SYSLOG_SERVER:514
 RSY
 
 # === Final start (now port 514 is 100% free) ===
-systemctl restart rsyslog auditd &>/dev/null || true
-systemctl enable --now rsyslog auditd &>/dev/null || true
+systemctl restart rsyslog auditd &>/dev/null
+systemctl enable --now rsyslog auditd &>/dev/null
 
 # === Only ONE green line ===
 echo -e "\033[1;32mCLIENT 100% READY!\033[0m"
@@ -366,7 +343,7 @@ while true; do
  sleep "$CHECK_INTERVAL"
 done
 CW
-chmod +x /usr/local/bin/client-watchdog.sh || true
+chmod +x /usr/local/bin/client-watchdog.sh
 cat > /etc/systemd/system/client-watchdog.service <<'UNIT'
 [Unit]
 Description=Client Watchdog: poweroff if syslog server unreachable
@@ -383,7 +360,7 @@ User=root
 [Install]
 WantedBy=multi-user.target
 UNIT
-systemctl daemon-reload || true
+systemctl daemon-reload
 systemctl enable --now client-watchdog.service 2>/dev/null || true
 
 ORIGCLIENT
@@ -392,3 +369,4 @@ ORIGCLIENT
 
 echo "Client wrapper finished."
 exit 0
+CLIENT_EOF
