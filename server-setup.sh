@@ -42,6 +42,58 @@ if [ -f /etc/os-release ]; then
 fi
 echo "RHEL-like: $IS_RHEL"
 
+# Ubuntu/Debian prep so the original RHEL-style script doesn't explode
+prep_ubuntu_named_env() {
+  echo "Non-RHEL detected — preparing Ubuntu/Debian env for RHEL-style named setup..."
+
+  # Install bind9 + tools + rsyslog if we're on apt-based system
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y || true
+    apt-get install -y bind9 dnsutils rsyslog >/dev/null 2>&1 || true
+  fi
+
+  # Make /var/named so your original script can drop zone files there
+  mkdir -p /var/named
+
+  # Create a 'named' user/group so chown named:named works AND bind can run as it
+  if ! id -u named >/dev/null 2>&1; then
+    if ! getent group named >/dev/null 2>&1; then
+      groupadd -r named || true
+    fi
+    useradd -r -g named -s /usr/sbin/nologin -d /var/named named 2>/dev/null || true
+  fi
+
+  chown -R named:named /var/named 2>/dev/null || true
+
+  # Make bind9 service behave like 'named' with /etc/named.conf + /var/named
+  if [ -f /etc/default/bind9 ]; then
+    if grep -q '^OPTIONS=' /etc/default/bind9; then
+      # Append -u named -c /etc/named.conf if not already there
+      if ! grep -q '\-c /etc/named.conf' /etc/default/bind9; then
+        sed -i 's/^OPTIONS="/OPTIONS="-u named -c \/etc\/named.conf /' /etc/default/bind9 || true
+      fi
+    else
+      echo 'OPTIONS="-u named -c /etc/named.conf"' >> /etc/default/bind9
+    fi
+  else
+    echo 'OPTIONS="-u named -c /etc/named.conf"' > /etc/default/bind9
+  fi
+
+  # Map named.service -> bind9.service so systemctl enable --now named works
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl list-unit-files | grep -q '^bind9.service'; then
+      if ! systemctl list-unit-files | grep -q '^named.service'; then
+        if [ -f /lib/systemd/system/bind9.service ]; then
+          mkdir -p /etc/systemd/system
+          ln -sf /lib/systemd/system/bind9.service /etc/systemd/system/named.service || true
+          systemctl daemon-reload || true
+        fi
+      fi
+    fi
+  fi
+}
+
 # helper: create repo files from a mounted ISO mountpoint (checks BaseOS/AppStream)
 create_repos_from_mount() {
   mp="$1"
@@ -150,7 +202,7 @@ add_server_ptr() {
   mkdir -p /var/named
   if [ ! -f "$revfile" ]; then
     cat > "$revfile" <<RZ
-\$TTL 86400
+$TTL 86400
 @ IN SOA ${fqdn}. root.${domain}. ( $(date +%Y%m%d)01 3H 1H 1W 1D )
 @ IN NS ${fqdn}.
 ; PTR records
@@ -210,7 +262,7 @@ include "/etc/named.root.key";
 EON
 
 cat > /var/named/$DOMAIN.zone <<EOZ
-\$TTL 86400
+$TTL 86400
 @ IN SOA $FQDN. root.$DOMAIN. ( $(date +%Y%m%d)01 3H 1H 1W 1D )
 @ IN NS $FQDN.
 $(echo $FQDN | cut -d. -f1) IN A $IP
@@ -360,12 +412,17 @@ ORIG
 
 # run original installer block (unchanged)
 echo "Executing original installer block..."
-/usr/local/bin/setup-my-dns-and-logging-server.sh.orig_script_block "$IP" "$FQDN" "$DOMAIN" || true
+if [ "$IS_RHEL" -eq 1 ]; then
+  /usr/local/bin/setup-my-dns-and-logging-server.sh.orig_script_block "$IP" "$FQDN" "$DOMAIN" || true
+else
+  prep_ubuntu_named_env
+  /usr/local/bin/setup-my-dns-and-logging-server.sh.orig_script_block "$IP" "$FQDN" "$DOMAIN" || true
+fi
 
 # ensure server PTR
 add_server_ptr "$IP" "$FQDN" "$DOMAIN" || true
 
-# place enhanced add-client (A+PTR) (you allowed)
+# place enhanced add-client (A+PTR)
 cat > /usr/local/bin/add-client.sh <<'ADDCLIENT'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -381,7 +438,7 @@ if echo "$IP" | grep -E -q '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
   a=$(echo "$IP" | cut -d. -f1); b=$(echo "$IP" | cut -d. -f2); c=$(echo "$IP" | cut -d. -f3); d=$(echo "$IP" | cut -d. -f4)
   REV="${c}.${b}.${a}.in-addr.arpa"; RF="$ZONE_DIR/${REV}.zone"
   if [ ! -f "$RF" ]; then cat > "$RF" <<RZ
-\$TTL 86400
+$TTL 86400
 @ IN SOA ${FQDN}. root.${DOMAIN}. ( $(date +%Y%m%d)01 3H 1H 1W 1D )
 @ IN NS ${FQDN}.
 ; PTR
