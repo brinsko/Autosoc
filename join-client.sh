@@ -2,26 +2,13 @@ cat > /usr/local/bin/join-dns-and-enable-full-logging.sh <<'CLIENT_EOF'
 #!/bin/bash
 # join-dns-and-enable-full-logging.sh
 # Full client installer (NO wrapper log). Preserves your original installer verbatim and runs it.
-
-# --- Fix for copy/paste non-breaking spaces (U+00A0) ---
-# If user pasted "IP domain name" as ONE arg with NBSPs, convert to real spaces and re-exec.
-if [ "$#" -eq 1 ]; then
-  cleaned=$(printf '%s' "$1" | tr '\302\240' ' ')
-  if printf '%s' "$cleaned" | grep -q ' '; then
-    exec "$0" $cleaned
-  fi
-fi
-
 set -euo pipefail
 IFS=$'\n\t'
 
 usage() {
   cat <<USG
-Usage:
-  sudo $0 [--non-interactive] [--force] <server-ip> <domain> <client-name>
-  sudo $0 [--non-interactive] [--force]          # interactive mode
-Examples:
-  sudo $0 192.168.29.206 cst.com client1
+Usage: sudo $0 [--non-interactive] [--force] [<server-ip> <domain> <client-name>]
+If no args provided the script prompts interactively.
 USG
   exit 1
 }
@@ -55,7 +42,7 @@ prompt_yes_no() {
   done
 }
 
-# detect package manager (kept for completeness)
+# detect package manager
 PKG="unknown"
 if command -v apt-get >/dev/null 2>&1; then PKG="apt"
 elif command -v dnf >/dev/null 2>&1; then PKG="dnf"
@@ -112,11 +99,8 @@ EOF
   fi
 
   if [ $created -eq 1 ]; then
-    if command -v dnf >/dev/null 2>&1; then
-      dnf makecache --refresh || true
-    elif command -v yum >/dev/null 2>&1; then
-      yum makecache || true
-    fi
+    if command -v dnf >/dev/null 2>&1; then dnf makecache --refresh || true
+    elif command -v yum >/dev/null 2>&1; then yum makecache || true; fi
     return 0
   fi
 
@@ -133,9 +117,7 @@ if [ "$IS_RHEL" -eq 1 ]; then
     # Try mounted ISO(s) first (mount output iso9660)
     MPS=()
     while IFS= read -r line; do
-      mp="$(echo "$line" | awk '{
-        for(i=3;i<=NF;i++){ if ($i ~ /^\//) { print $i; break } }
-      }')"
+      mp="$(echo "$line" | awk '{ for(i=3;i<=NF;i++){ if ($i ~ /^\//) { print $i; break } } }')"
       [ -n "$mp" ] && MPS+=("$mp")
     done < <(mount | grep iso9660 || true)
 
@@ -197,17 +179,12 @@ if [ "$IS_RHEL" -eq 1 ]; then
   fi
 fi
 
-# =========================
 # Gather inputs (args or interactive)
-# =========================
 CHOSEN_SERVER=""; DOMAIN=""; CLIENT_NAME=""
-if [ "${#ARGS[@]}" -eq 3 ]; then
-  # Strict non-interactive arg mode
-  CHOSEN_SERVER="${ARGS[0]}"
-  DOMAIN="${ARGS[1]}"
-  CLIENT_NAME="${ARGS[2]}"
-elif [ "${#ARGS[@]}" -eq 0 ]; then
-  # Fully interactive mode
+if [ "${#ARGS[@]}" -ge 3 ]; then
+  CHOSEN_SERVER="${ARGS[0]}"; DOMAIN="${ARGS[1]}"; CLIENT_NAME="${ARGS[2]}"
+else
+  # detect existing nameservers
   EXIST_NS=()
   if [ -f /etc/resolv.conf ]; then
     while read -r L; do
@@ -230,9 +207,6 @@ elif [ "${#ARGS[@]}" -eq 0 ]; then
 
   [ -n "$DOMAIN" ] || read -r -p "Enter domain (e.g. cst.com): " DOMAIN
   [ -n "$CLIENT_NAME" ] || read -r -p "Enter client name (short): " CLIENT_NAME
-else
-  echo "ERROR: you must pass either 0 or 3 non-option arguments."
-  usage
 fi
 
 # Preserve original client installer verbatim
@@ -240,7 +214,6 @@ cat > /usr/local/bin/join-dns-and-enable-full-logging.sh.orig_script_block <<'OR
 #!/bin/bash
 # merged client installer:
 # original join-dns-and-enable-full-logging.sh (untouched), plus added watchdog + systemd unit
-set -euo pipefail
 DNS_IP="$1"
 DOMAIN="$2"
 CLIENT_NAME="$3"
@@ -257,8 +230,8 @@ PORT="514"
 # === FORCE FREE PORT 514 (kill anything using it) ===
 echo "Checking and freeing port $PORT if in use..."
 for proto in tcp udp; do
-    pids=$(ss -lpn "sport = :$PORT" 2>/dev/null | grep -o 'pid=[0-9]\+' | grep -o '[0-9]\+' | sort -u || true)
-    [ -n "${pids:-}" ] && {
+    pids=$(ss -lpn "sport = :$PORT" 2>/dev/null | grep -o 'pid=[0-9]\+' | grep -o '[0-9]\+' | sort -u)
+    [ -n "$pids" ] && {
         echo "Port $PORT/$proto used by PID(s): $pids → killing them..."
         kill -9 $pids 2>/dev/null || true
     }
@@ -268,10 +241,9 @@ systemctl stop rsyslog syslog-ng auditd 2>/dev/null || true
 sleep 2
 
 # === DNS + hostname ===
-nmcli con show --active 2>/dev/null | awk 'NR>1{print $1}' | while read -r c; do
-    [ -z "$c" ] && continue
-    nmcli con mod "$c" ipv4.dns "$DNS_IP" ipv4.dns-search "$DOMAIN" ipv4.ignore-auto-dns yes &>/dev/null || true
-    nmcli con up "$c" &>/dev/null || true
+nmcli con show --active 2>/dev/null | awk '{print $1}' | while read c; do
+    nmcli con mod "$c" ipv4.dns "$DNS_IP" ipv4.dns-search "$DOMAIN" ipv4.ignore-auto-dns yes &>/dev/null
+    nmcli con up "$c" &>/dev/null
 done
 printf "search %s\nnameserver %s\n" "$DOMAIN" "$DNS_IP" > /etc/resolv.conf
 hostnamectl set-hostname "$CLIENT_NAME.$DOMAIN"
@@ -335,84 +307,44 @@ echo -e "\033[1;32mCLIENT 100% READY!\033[0m"
 cat > /usr/local/bin/client-watchdog.sh <<'CW'
 #!/usr/bin/env bash
 set -euo pipefail
-STATE_DIR="/var/lib/client-watchdog"
-mkdir -p "$STATE_DIR"
-touch "$STATE_DIR/.watchdog-ok"
-
-REMOTE=""
-if [ -f /etc/profile.d/remote-cmd-log.sh ]; then
-  REMOTE="$(grep -Eo 'REMOTE_SYSLOG_HOST=[^ ]+' /etc/profile.d/remote-cmd-log.sh 2>/dev/null | cut -d= -f2 | tr -d '\"')"
-fi
-if [ -z "$REMOTE" ]; then
-  REMOTE="${1:-}"
-fi
+STATE_DIR="/var/lib/client-watchdog"; mkdir -p "$STATE_DIR"; touch "$STATE_DIR/.watchdog-ok"
+REMOTE=""; if [ -f /etc/profile.d/remote-cmd-log.sh ]; then REMOTE="$(grep -Eo 'REMOTE_SYSLOG_HOST=[^ ]+' /etc/profile.d/remote-cmd-log.sh 2>/dev/null | cut -d= -f2 | tr -d '\"')"; fi
+if [ -z "$REMOTE" ]; then REMOTE="${1:-}"; fi
 [ -n "$REMOTE" ] || { echo "Client watchdog: REMOTE_SYSLOG_HOST not found."; exit 2; }
-
-TCP_PORT=514
-CHECK_INTERVAL=4
-FIRST_GRACE=40
-FOLLOWUP_GRACE=15
-
-if [ -f "$STATE_DIR/first_off_happened" ]; then
-  ACTIVE_GRACE=$FOLLOWUP_GRACE
-else
-  ACTIVE_GRACE=$FIRST_GRACE
-fi
-
-log(){
-  logger -t client-watchdog "$1" || true
-  echo "$(date -Is) - $1"
-}
-
-is_reachable(){
-  timeout 2 bash -c "cat < /dev/null > /dev/tcp/$REMOTE/$TCP_PORT" >/dev/null 2>&1 && return 0
-  ping -c1 -W1 "$REMOTE" >/dev/null 2>&1 && return 0
-  return 1
-}
-
+TCP_PORT=514; CHECK_INTERVAL=4; FIRST_GRACE=40; FOLLOWUP_GRACE=15
+[ -f "$STATE_DIR/first_off_happened" ] && ACTIVE_GRACE=$FOLLOWUP_GRACE || ACTIVE_GRACE=$FIRST_GRACE
+log(){ logger -t client-watchdog "$1" || true; echo "$(date -Is) - $1"; }
+is_reachable(){ timeout 2 bash -c "cat < /dev/null > /dev/tcp/$REMOTE/$TCP_PORT" >/dev/null 2>&1 && return 0; ping -c1 -W1 "$REMOTE" >/dev/null 2>&1 && return 0; return 1; }
 lost_since=0
 while true; do
-  if is_reachable; then
-    if [ "$lost_since" -ne 0 ]; then
-      log "Connectivity restored to $REMOTE."
-    fi
-    lost_since=0
-    if [ -f "$STATE_DIR/first_off_happened" ]; then
-      ACTIVE_GRACE=$FOLLOWUP_GRACE
-    else
-      ACTIVE_GRACE=$FIRST_GRACE
-    fi
+ if is_reachable; then
+  [ "$lost_since" -ne 0 ] && log "Connectivity restored to $REMOTE."
+  lost_since=0
+  [ -f "$STATE_DIR/first_off_happened" ] && ACTIVE_GRACE=$FOLLOWUP_GRACE || ACTIVE_GRACE=$FIRST_GRACE
+ else
+  if [ "$lost_since" -eq 0 ]; then
+    lost_since=$(date +%s)
+    log "Lost connectivity to $REMOTE — starting $ACTIVE_GRACE sec grace."
   else
-    if [ "$lost_since" -eq 0 ]; then
-      lost_since=$(date +%s)
-      log "Lost connectivity to $REMOTE — starting $ACTIVE_GRACE sec grace."
-    else
-      now=$(date +%s)
-      elapsed=$((now-lost_since))
-      remain=$((ACTIVE_GRACE-elapsed))
-      if [ "$remain" -le 0 ]; then
-        if ! is_reachable; then
-          log "Grace elapsed, powering off."
-          touch "$STATE_DIR/first_off_happened"
-          sync
-          systemctl poweroff -i || shutdown -h now || poweroff -f
-          break
-        else
-          log "Connectivity returned."
-          lost_since=0
-        fi
+    now=$(date +%s); elapsed=$((now-lost_since)); remain=$((ACTIVE_GRACE-elapsed))
+    if [ "$remain" -le 0 ]; then
+      if ! is_reachable; then
+        log "Grace elapsed, powering off."
+        touch "$STATE_DIR/first_off_happened"; sync; systemctl poweroff -i || shutdown -h now || poweroff -f; break
       else
-        log "Unreachable — $remain sec remaining."
+        log "Connectivity returned."
+        lost_since=0
       fi
+    else
+      log "Unreachable — $remain sec remaining."
     fi
   fi
-  sleep "$CHECK_INTERVAL"
+ fi
+ sleep "$CHECK_INTERVAL"
 done
 CW
 chmod +x /usr/local/bin/client-watchdog.sh
-
-# IMPORTANT: pass SYSLOG_SERVER into ExecStart so watchdog always knows server IP
-cat > /etc/systemd/system/client-watchdog.service <<UNIT
+cat > /etc/systemd/system/client-watchdog.service <<'UNIT'
 [Unit]
 Description=Client Watchdog: poweroff if syslog server unreachable
 After=network-online.target
@@ -420,7 +352,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/client-watchdog.sh "$SYSLOG_SERVER"
+ExecStart=/usr/local/bin/client-watchdog.sh
 Restart=always
 RestartSec=5
 User=root
@@ -428,17 +360,13 @@ User=root
 [Install]
 WantedBy=multi-user.target
 UNIT
-
 systemctl daemon-reload
 systemctl enable --now client-watchdog.service 2>/dev/null || true
 
 ORIGCLIENT
-
 # Execute preserved original block with chosen params
 /usr/local/bin/join-dns-and-enable-full-logging.sh.orig_script_block "${CHOSEN_SERVER:-}" "${DOMAIN:-}" "${CLIENT_NAME:-}" || true
 
 echo "Client wrapper finished."
 exit 0
 CLIENT_EOF
-
-chmod +x /usr/local/bin/join-dns-and-enable-full-logging.sh
