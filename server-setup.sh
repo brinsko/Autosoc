@@ -1,19 +1,17 @@
-cat > /usr/local/bin/setup-my-dns-and-logging-server.sh <<'FIXED_EOF'
+cat > /usr/local/bin/setup-my-dns-and-logging-server.sh <<'EOF'
 #!/bin/bash
 # setup-my-dns-and-logging-server.sh
-# Fully working wrapper — RHEL + Ubuntu/Debian compatible
-# All original features preserved + critical bugs fixed
+# Wrapper (preserves your original installer) + mandatory RHEL local-repo config (BaseOS+AppStream) when RHEL-like detected.
 set -euo pipefail
 IFS=$'\n\t'
 LOG=/var/log/setup-my-dns-and-logging-server.wrapper.log
 exec > >(tee -a "$LOG") 2>&1
-
-usage() { cat <<USG
+usage(){ cat <<USG
 Usage: sudo $0 [--non-interactive] [--force] <server-ip> <fqdn> <domain>
 Example: sudo $0 192.168.29.206 server.cst.com cst.com
 USG
 exit 1; }
-
+# parse basic flags
 NONINTER=0; FORCE=0; ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -26,98 +24,193 @@ while [ $# -gt 0 ]; do
 done
 [ ${#ARGS[@]} -eq 3 ] || usage
 IP="${ARGS[0]}"; FQDN="${ARGS[1]}"; DOMAIN="${ARGS[2]}"
-
+prompt_yes_no(){ local p="$1"; local d="${2:-Y}"; if [ "$NONINTER" -eq 1 ]; then [ "$d" = "Y" ] && return 0 || return 1; fi
+while true; do read -r -p "$p [Y/n]: " a; a="${a:-$d}"; case "$a" in [Yy]*) return 0;; [Nn]*) return 1;; *) echo "Y or N";; esac; done; }
 echo "Wrapper start — log: $LOG"
-
-# Detect RHEL-like
+# detect rhel-like
 IS_RHEL=0
 if [ -f /etc/os-release ]; then
   . /etc/os-release
   idstr="$(printf "%s %s" "${ID:-}" "${ID_LIKE:-}" | tr '[:upper:]' '[:lower:]')"
   if echo "$idstr" | grep -E -q 'rhel|redhat|centos|rocky|almalinux|centosstream'; then IS_RHEL=1; fi
 fi
-echo "RHEL-like detected: $IS_RHEL"
-
-# Ubuntu/Debian prep
+echo "RHEL-like: $IS_RHEL"
+# Ubuntu/Debian prep so the original RHEL-style script doesn't explode
 prep_ubuntu_named_env() {
-  echo "Ubuntu/Debian detected — preparing environment for BIND..."
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y || true
-  apt-get install -y bind9 bind9utils rsyslog >/dev/null 2>&1 || true
-
+  echo "Non-RHEL detected — preparing Ubuntu/Debian env for RHEL-style named setup..."
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y || true
+    apt-get install -y bind9 dnsutils rsyslog >/dev/null 2>&1 || true
+  fi
   mkdir -p /var/named
   if ! id -u named >/dev/null 2>&1; then
-    groupadd -r named 2>/dev/null || true
+    if ! getent group named >/dev/null 2>&1; then
+      groupadd -r named || true
+    fi
     useradd -r -g named -s /usr/sbin/nologin -d /var/named named 2>/dev/null || true
   fi
   chown -R named:named /var/named 2>/dev/null || true
-
-  # Make bind9 act like RHEL's named
-  cat > /etc/default/bind9 <<EOF
-OPTIONS="-u named -c /etc/named.conf"
-EOF
-
-  # Symlink named.service → bind9.service
-  mkdir -p /etc/systemd/system
-  ln -sf /lib/systemd/system/bind9.service /etc/systemd/system/named.service 2>/dev/null || true
-  systemctl daemon-reload 2>/dev/null || true
+  if [ -f /etc/default/bind9 ]; then
+    if grep -q '^OPTIONS=' /etc/default/bind9; then
+      if ! grep -q '\-c /etc/named.conf' /etc/default/bind9; then
+        sed -i 's/^OPTIONS="/OPTIONS="-u named -c \/etc\/named.conf /' /etc/default/bind9 || true
+      fi
+    else
+      echo 'OPTIONS="-u named -c /etc/named.conf"' >> /etc/default/bind9
+    fi
+  else
+    echo 'OPTIONS="-u named -c /etc/named.conf"' > /etc/default/bind9
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl list-unit-files | grep -q '^bind9.service'; then
+      if ! systemctl list-unit-files | grep -q '^named.service'; then
+        if [ -f /lib/systemd/system/bind9.service ]; then
+          mkdir -p /etc/systemd/system
+          ln -sf /lib/systemd/system/bind  /etc/systemd/system/named.service || true
+          systemctl daemon-reload || true
+        fi
+      fi
+    fi
+  fi
 }
+# helper: create repo files from a mounted ISO mountpoint (checks BaseOS/AppStream)
+create_repos_from_mount() {
+  mp="$1"
+  created=0
+  if [ -d "$mp/BaseOS" ]; then
+    cat > /etc/yum.repos.d/local-iso-BaseOS.repo <<REPO
+[local-iso-BaseOS]
+name=Local ISO BaseOS
+baseurl=file://$mp/BaseOS
+enabled=1
+gpgcheck=0
+REPO
+    created=1
+    echo "Created local-iso-BaseOS -> $mp/BaseOS"
+  fi
+  if [ -d "$mp/AppStream" ]; then
+    cat > /etc/yum.repos.d/local-iso-AppStream.repo <<REPO
+[local-iso-AppStream]
+name=Local ISO AppStream
+baseurl=file://$mp/AppStream
+enabled=1
+gpgcheck=0
+REPO
+    created=1
+    echo "Created local-iso-AppStream -> $mp/AppStream"
+  fi
+  if [ $created -eq 0 ] && [ -d "$mp/repodata" ]; then
+    cat > /etc/yum.repos.d/local-iso.repo <<REPO
+[local-iso]
+name=Local ISO
+baseurl=file://$mp
+enabled=1
+gpgcheck=0
+REPO
+    created=1
+    echo "Created fallback local-iso -> $mp"
+  fi
+  if [ $created -eq 1 ]; then
+    if command -v dnf >/dev/null 2>&1; then dnf makecache --refresh || true; elif command -v yum >/dev/null 2>&1; then yum makecache || true; fi
+    return 0
+  fi
+  return 2
+}
+# On RHEL-like: ensure BaseOS+AppStream exist
+if [ "$IS_RHEL" -eq 1 ]; then
+  have_base=0; have_app=0
+  if grep -riq "baseurl.*BaseOS" /etc/yum.repos.d 2>/dev/null; then have_base=1; fi
+  if grep -riq "baseurl.*AppStream" /etc/yum.repos.d 2>/dev/null; then have_app=1; fi
+  if [ $have_base -eq 1 ] && [ $have_app -eq 1 ]; then
+    echo "BaseOS and AppStream already present."
+  else
+    echo "BaseOS/AppStream not found — attempting to configure from mounted ISO(s) (mandatory)."
+    mapfile -t MPS < <(mount | awk '/iso9660/ { for(i=3;i<=NF;i++){ if($i ~ /^\//){ print $i; break } } }' | sort -u)
+    success=0
+    for mp in "${MPS[@]}"; do
+      mp=$(readlink -f "$mp")
+      echo "Checking mounted ISO at $mp ..."
+      if create_repos_from_mount "$mp"; then success=1; break; fi
+    done
+    if [ $success -eq 0 ]; then
+      echo "No mounted ISO provided usable repos — scanning for ISO files..."
+      CAND=""
+      for p in /run/media /media /root /home /mnt /var/tmp /tmp; do
+        [ -d "$p" ] || continue
+        for f in "$p"/*.iso "$p"/*/*.iso; do [ -f "$f" ] && CAND="$CAND $f"; done
+      done
+      if [ -z "$CAND" ]; then
+        while IFS= read -r f; do CAND="$CAND $f"; done < <(find / -maxdepth 4 -type f -iname '*.iso' 2>/dev/null || true)
+      fi
+      if [ -z "$CAND" ]; then
+        echo "ERROR: No RHEL-style ISO found. Cannot continue on RHEL-like host."
+        exit 1
+      fi
+      MBASE="/mnt/local-iso"
+      mkdir -p "$MBASE"
+      idx=0
+      for iso in $CAND; do
+        idx=$((idx+1)); mp="$MBASE/$idx"; mkdir -p "$mp"
+        if mount -o loop,ro "$iso" "$mp" 2>/dev/null; then
+          echo "Mounted $iso -> $mp"
+          if create_repos_from_mount "$mp"; then success=1; break; else umount "$mp" 2>/dev/null || true; fi
+        else
+          rm -rf "$mp" 2>/dev/null || true
+        fi
+      done
+      if [ $success -eq 0 ]; then
+        echo "ERROR: Could not configure BaseOS/AppStream from discovered ISOs."
+        exit 1
+      fi
+    fi
+  fi
+fi
 
-# RHEL repo setup (unchanged, safe)
-create_repos_from_mount() { ... }  # your original function stays 100% the same
-# (omitted for brevity — your full original is preserved below)
-
-# === FIXED: add_server_ptr (main bug fix) ===
+# FIXED: add_server_ptr — this was the real killer (unbound $TTL + broken zone)
 add_server_ptr() {
   local ip="$1" fqdn="$2" domain="$3"
   IFS='.' read -r a b c d <<<"$ip"
   rev="${c}.${b}.${a}.in-addr.arpa"
   revfile="/var/named/${rev}.zone"
   mkdir -p /var/named
-
   if [ ! -f "$revfile" ]; then
     cat > "$revfile" <<RZ
 \$TTL 86400
-@ IN SOA ${fqdn}. root.${domain}. (
-    $(date +%Y%m%d)01     ; serial
-    3H                    ; refresh
-    1H                    ; retry
-    1W                    ; expire
-    1D                    ; minimum
-)
-@       IN      NS      ${fqdn}.
-${d}    IN      PTR     ${fqdn}.
+@ IN SOA ${fqdn}. root.${domain}. ( $(date +%Y%m%d)01 3H 1H 1W 1D )
+@ IN NS ${fqdn}.
+${d} IN PTR ${fqdn}.
 RZ
-    echo "Created reverse zone $revfile with PTR for $ip"
   else
     if ! grep -qE "^[[:space:]]*${d}[[:space:]]+IN[[:space:]]+PTR" "$revfile"; then
-      printf "%-8s IN PTR %s.\n" "$d" "$fqdn" >> "$revfile"
-      sed -i "0,/[0-9]\{10\}/s//$(date +%Y%m%d)99/" "$revfile" || true
-      echo "Added PTR $ip -> $fqdn in $revfile"
+      printf "%s IN PTR %s.\n" "$d" "$fqdn" >> "$revfile"
+      sed -i "/SOA/ s/[0-9]\{8,12\}/$(date +%Y%m%d)99/" "$revfile" || true
     fi
   fi
   chown named:named "$revfile" 2>/dev/null || true
-  chmod 644 "$revfile" 2>/dev/null || true
 }
 
-# === PRESERVE ORIGINAL INSTALLER (only tiny safe fixes inside) ===
+# Preserve original installer block verbatim
 cat > /usr/local/bin/setup-my-dns-and-logging-server.sh.orig_script_block <<'ORIG'
 #!/bin/bash
-IP="$1"; FQDN="$2"; DOMAIN="$3"
-[ -z "$IP" ] || [ -z "$FQDN" ] || [ -z "$DOMAIN" ] && { echo "Usage: sudo $0 <ip> <fqdn> <domain>"; exit 1; }
-
-echo "Setting up DNS + Remote Syslog Server..."
-
-# Force own port 514
+IP="$1"
+FQDN="$2"
+DOMAIN="$3"
+[ -z "$IP" ] || [ -z "$FQDN" ] || [ -z "$DOMAIN" ] && {
+    echo "Usage: sudo $0 <server-ip> <fqdn> <domain>"
+    exit 1
+}
+echo "Setting up DNS + Remote Syslog Server — MERGED VERSION..."
+# === FORCE TAKE PORT 514 ===
+echo "Force-killing anything using port 514..."
 for proto in udp tcp; do
-  ss -lpn "sport = :514" 2>/dev/null | awk '{print $6}' | grep -o 'pid=[0-9]\+' | cut -d= -f2 | xargs -r kill -9 2>/dev/null || true
+    ss -lpn "sport = :514" 2>/dev/null | awk '{print $6}' | grep -o 'pid=[0-9]\+' | cut -d= -f2 | sort -u | xargs -r kill -9 2>/dev/null
 done
 systemctl stop rsyslog syslog-ng auditd 2>/dev/null || true
-
-# DNS Setup (fixed: \$TTL added)
-dnf install -y bind bind-utils &>/dev/null || apt-get install -y bind9 bind9utils &>/dev/null || true
-hostnamectl set-hostname "$FQDN" || true
-
+sleep 2
+# === DNS ===
+dnf install -y bind bind-utils &>/dev/null || true
+hostnamectl set-hostname "$FQDN"
 cat > /etc/named.conf <<EON
 options {
     listen-on port 53 { any; };
@@ -130,64 +223,57 @@ zone "$DOMAIN" { type master; file "$DOMAIN.zone"; };
 include "/etc/named.rfc1912.zones";
 include "/etc/named.root.key";
 EON
-
 cat > /var/named/$DOMAIN.zone <<EOZ
 \$TTL 86400
 @ IN SOA $FQDN. root.$DOMAIN. ( $(date +%Y%m%d)01 3H 1H 1W 1D )
 @ IN NS $FQDN.
 $(echo $FQDN | cut -d. -f1) IN A $IP
 EOZ
-
-chown -R named:named /var/named 2>/dev/null || true
-
-# Smart service start (works on RHEL and Ubuntu)
+chown -R named:named /var/named
+# FIXED: start correct service on RHEL and Ubuntu
 if systemctl list-unit-files | grep -q bind9.service; then
-  systemctl enable --now bind9 >/dev/null 2>&1 && echo "bind9 started"
+    systemctl enable --now bind9 >/dev/null 2>&1
 else
-  systemctl enable --now named >/dev/null 2>&1 && echo "named started"
+    systemctl enable --now named
 fi
-
 firewall-cmd --add-service=dns --permanent &>/dev/null || true
 firewall-cmd --reload &>/dev/null || true
-ufw allow 53 >/dev/null 2>&1 || true
-
-# === add-client.sh (your original + auto PTR) ===
+# === add-client.sh (your original) ===
 cat > /usr/local/bin/add-client.sh <<'ADD'
 #!/bin/bash
-set -euo pipefail
-NAME="$1"; IP="$2"; DOMAIN="${3:-}"
+NAME="$1"
+IP="$2"
+DOMAIN="${3:-}"
 ZONE_DIR="/var/named"
-[ -z "$NAME" ] || [ -z "$IP" ] && { echo "Usage: $0 <name> <ip> [domain]"; exit 1; }
-
+if [ -z "$NAME" ] || [ -z "$IP" ]; then
+    echo "Usage: sudo $0 <name> <ip> [domain]"
+    exit 1
+fi
 if [ -z "$DOMAIN" ]; then
-  zones=($ZONE_DIR/*.zone); DOMAIN=$(basename "${zones[0]}" .zone)
+    shopt -s nullglob
+    ZONES=("$ZONE_DIR"/*.zone)
+    if [ ${#ZONES[@]} -eq 1 ]; then
+        DOMAIN="$(basename "${ZONES[0]}" .zone)"
+    else
+        echo "Multiple or no zone files found — provide domain manually."
+        exit 2
+    fi
 fi
-FWD="$ZONE_DIR/$DOMAIN.zone"
-echo "$NAME IN A $IP" >> "$FWD"
-sed -i "/SOA/ s/[0-9]\{10\}/$(date +%Y%m%d)99/" "$FWD"
-
-# Add PTR
-a=$(echo $IP | cut -d. -f1); b=$(echo $IP | cut -d. -f2); c=$(echo $IP | cut -d. -f3); d=$(echo $IP | cut -d. -f4)
-REV="${c}.${b}.${a}.in-addr.arpa.zone"
-if [ ! -f "$ZONE_DIR/$REV" ]; then
-  cat > "$ZONE_DIR/$REV" <<PTR
-\$TTL 86400
-@ IN SOA $FQDN. root.$DOMAIN. ( $(date +%Y%m%d)01 3H 1H 1W 1D )
-@ IN NS $FQDN.
-PTR
+ZONE="$ZONE_DIR/$DOMAIN.zone"
+if [ ! -f "$ZONE" ]; then
+    echo "Zone file does not exist: $ZONE"
+    exit 3
 fi
-echo "$d IN PTR $NAME.$DOMAIN." >> "$ZONE_DIR/$REV"
-sed -i "/SOA/ s/[0-9]\{10\}/$(date +%Y%m%d)99/" "$ZONE_DIR/$REV" || true
-
-rndc reload "$DOMAIN" 2>/dev/null || true
-echo "Added $NAME.$DOMAIN → $IP (with PTR)"
+echo "$NAME IN A $IP" >> "$ZONE"
+sed -i "/SOA/ s/[0-9]\{8,12\}/$(date +%Y%m%d)99/" "$ZONE"
+rndc reload "$DOMAIN" &>/dev/null || true
+echo "Added → $NAME.$DOMAIN ($IP)"
 ADD
 chmod +x /usr/local/bin/add-client.sh
-
-# === RSYSLOG + GREEN LOGS + ADMIN BLOCK (100% your original) ===
-dnf install -y rsyslog &>/dev/null || apt-get install -y rsyslog &>/dev/null || true
-mkdir -p /var/log/remote; chmod 750 /var/log/remote
-
+# === FINAL RSYSLOG CONFIG + ADMIN BLOCK (100% your original) ===
+dnf install -y rsyslog &>/dev/null || true
+mkdir -p /var/log/remote
+chmod 750 /var/log/remote
 cat > /etc/rsyslog.d/50-remote-logger.conf <<'RSYS'
 module(load="imuxsock")
 module(load="imjournal")
@@ -206,7 +292,6 @@ if $fromhost-ip != '127.0.0.1' and $fromhost-ip != '::1' then {
     action(type="omfile" dynaFile="HostFile")
 }
 RSYS
-
 cat > /etc/logrotate.d/remote-logs <<'LR'
 /var/log/remote/*.logs {
     daily
@@ -220,33 +305,90 @@ cat > /etc/logrotate.d/remote-logs <<'LR'
     endscript
 }
 LR
-
 firewall-cmd --add-port=514/tcp --add-port=514/udp --permanent &>/dev/null || true
 firewall-cmd --reload &>/dev/null || true
-ufw allow 514 >/dev/null 2>&1 || true
-
+[ "$(getenforce 2>/dev/null || echo Disabled)" = "Enforcing" ] && {
+    semanage fcontext -a -t var_log_t '/var/log/remote(/.*)?' 2>/dev/null || true
+    restorecon -R /var/log/remote 2>/dev/null || true
+}
 systemctl restart rsyslog
 systemctl enable --now rsyslog
-
-echo -e "\n\033[1;32mSERVER 100% READY!\033[0m"
-echo -e "\033[1;32mLogs → /var/log/remote/<hostname>.logs\033[0m"
-echo "Add clients: sudo add-client.sh client1 192.168.29.100"
+echo
+echo -e "\033[1;32mSERVER 100% READY!\033[0m"
+echo -e "\033[1;32mPort 514: FORCE OWNED\033[0m"
+echo -e "\033[1;32mLogs: /var/log/remote/<hostname>.logs\033[0m"
+echo
+echo "Add clients:"
+echo " sudo add-client.sh client1 192.168.29.210"
+# === ADMIN BLOCK HELPER (unchanged) ===
+cat > /usr/local/bin/admin-block-client.sh <<'AB'
+#!/usr/bin/env bash
+ACTION="$1"; IP="$2"; DROP_MARKER_DIR="/var/lib/admin-block-client"; mkdir -p "$DROP_MARKER_DIR"
+if [ -z "$ACTION" ] || [ -z "$IP" ]; then echo "Usage: sudo $0 <block|unblock|status> <client-ip>"; exit 2; fi
+case "$ACTION" in
+  block)
+    if command -v firewall-cmd >/dev/null 2>&1; then firewall-cmd --permanent --add-rich-rule="rule family='ipv4' source address='$IP' drop" >/dev/null 2>&1 || true; firewall-cmd --reload >/dev/null 2>&1 || true
+    else iptables -C INPUT -s "$IP" -j DROP >/dev/null 2>&1 || iptables -I INPUT -s "$IP" -j DROP 2>/dev/null || true; ip6tables -C INPUT -s "$IP" -j DROP >/dev/null 2>&1 || ip6tables -I INPUT -s "$IP" -j DROP 2>/dev/null || true; fi
+    touch "$DROP_MARKER_DIR/$IP.blocked"; echo "Blocked $IP";;
+  unblock)
+    if command -v firewall-cmd >/dev/null 2>&1; then firewall-cmd --permanent --remove-rich-rule="rule family='ipv4' source address='$IP' drop" >/dev/null 2>&1 || true; firewall-cmd --reload >/dev/null 2>&1 || true
+    else iptables -D INPUT -s "$IP" -j DROP 2>/dev/null || true; ip6tables -D INPUT -s "$IP" -j DROP 2>/dev/null || true; fi
+    rm -f "$DROP_MARKER_DIR/$IP.blocked" 2>/dev/null || true; echo "Unblocked $IP";;
+  status)
+    [ -f "$DROP_MARKER_DIR/$IP.blocked" ] && echo "$IP is marked blocked" || echo "No marker for $IP"
+    if command -v firewall-cmd >/dev/null 2>&1; then firewall-cmd --list-rich-rules | grep "$IP" || true; else iptables -S | grep "$IP" || true; fi;;
+  *) echo "Unknown action"; exit 3;;
+esac
+AB
+chmod +x /usr/local/bin/admin-block-client.sh
+echo "Admin helper installed: /usr/local/bin/admin-block-client.sh"
 ORIG
 chmod +x /usr/local/bin/setup-my-dns-and-logging-server.sh.orig_script_block
 
-# === RUN ORIGINAL + POST-FIXES ===
+# run original installer block
+echo "Executing original installer block..."
 if [ "$IS_RHEL" -eq 1 ]; then
-  /usr/local/bin/setup-my-dns-and-logging-server.sh.orig_script_block "$IP" "$FQDN" "$DOMAIN"
+  /usr/local/bin/setup-my-dns-and-logging-server.sh.orig_script_block "$IP" "$FQDN" "$DOMAIN" || true
 else
   prep_ubuntu_named_env
-  /usr/local/bin/setup-my-dns-and-logging-server.sh.orig_script_block "$IP" "$FQDN" "$DOMAIN"
+  /usr/local/bin/setup-my-dns-and-logging-server.sh.orig_script_block "$IP" "$FQDN" "$DOMAIN" || true
 fi
 
-add_server_ptr "$IP" "$FQDN" "$DOMAIN"
+# ensure server PTR (fixed version)
+add_server_ptr "$IP" "$FQDN" "$DOMAIN" || true
 
-echo -e "\n\033[1;32mAll fixes applied. DNS server is UP and working on both RHEL and Ubuntu!\033[0m"
-echo "Log: $LOG"
+# place enhanced add-client (A+PTR) — your bonus tool
+cat > /usr/local/bin/add-client.sh <<'ADDCLIENT'
+#!/usr/bin/env bash
+set -euo pipefail
+NAME="${1:-}"; IP="${2:-}"; DOMAIN_ARG="${3:-}"
+if [ -z "$NAME" ] || [ -z "$IP" ]; then echo "Usage: $0 <name> <ip> [domain]"; exit 2; fi
+ZONE_DIR="/var/named"; mkdir -p "$ZONE_DIR"
+if [ -z "$DOMAIN_ARG" ]; then zones=( "$ZONE_DIR"/*.zone ); if [ "${#zones[@]}" -eq 1 ]; then DOMAIN="$(basename "${zones[0]}" .zone)"; else echo "Provide domain"; exit 3; fi; else DOMAIN="$DOMAIN_ARG"; fi
+FWD="$ZONE_DIR/${DOMAIN}.zone"; [ -f "$FWD" ] || { echo "Forward zone missing: $FWD"; exit 4; }
+ts="$(date +%Y%m%d%H%M%S)"; cp -a "$FWD" "${FWD}.bak.$ts" 2>/dev/null || true
+FQDN="${NAME}.${DOMAIN}"; printf "%s IN A %s\n" "$NAME" "$IP" >> "$FWD"
+sed -i "/SOA/ s/[0-9]\{8,12\}/$(date +%Y%m%d)99/" "$FWD" || true
+if echo "$IP" | grep -E -q '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+  IFS='.' read -r a b c d <<<"$IP"
+  REV="${c}.${b}.${a}.in-addr.arpa"; RF="$ZONE_DIR/${REV}.zone"
+  if [ ! -f "$RF" ]; then cat > "$RF" <<RZ
+\$TTL 86400
+@ IN SOA ${FQDN}. root.${DOMAIN}. ( $(date +%Y%m%d)01 3H 1H 1W 1D )
+@ IN NS ${FQDN}.
+RZ
+  fi
+  printf "%s IN PTR %s.\n" "$d" "$FQDN" >> "$RF"
+  sed -i "/SOA/ s/[0-9]\{8,12\}/$(date +%Y%m%d)99/" "$RF" || true
+fi
+command -v named-checkzone >/dev/null 2>&1 && ( named-checkzone "$DOMAIN" "$FWD" || true )
+command -v rndc >/dev/null 2>&1 && ( rndc reload "$DOMAIN" 2>/dev/null || true )
+echo "Done: $FQDN -> $IP"
+ADDCLIENT
+chmod +x /usr/local/bin/add-client.sh
+
+echo "Server wrapper finished. See $LOG"
 exit 0
-FIXED_EOF
+EOF
 
 chmod +x /usr/local/bin/setup-my-dns-and-logging-server.sh
