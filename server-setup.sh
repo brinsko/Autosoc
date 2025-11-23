@@ -1,7 +1,7 @@
 cat > /usr/local/bin/setup-my-dns-and-logging-server.sh <<'SERVER_EOF'
 #!/bin/bash
 # setup-my-dns-and-logging-server.sh
-# Wrapper (preserves your original installer) + mandatory RHEL local-repo config (BaseOS+AppStream) when RHEL-like detected.
+# Wrapper (preserves your original installer) + RHEL local-repo config + admin-block helper.
 set -euo pipefail
 IFS=$'\n\t'
 LOG=/var/log/setup-my-dns-and-logging-server.wrapper.log
@@ -9,7 +9,7 @@ exec > >(tee -a "$LOG") 2>&1
 
 usage(){ cat <<USG
 Usage: sudo $0 [--non-interactive] [--force] <server-ip> <fqdn> <domain>
-Example: sudo $0 192.168.29.206 server.cst.com cst.com
+Example: sudo $0 10.231.133.110 srv.net.com net.com
 USG
 exit 1; }
 
@@ -57,15 +57,12 @@ echo "RHEL-like: $IS_RHEL"
 # Ubuntu/Debian prep so the original RHEL-style script doesn't explode
 prep_ubuntu_named_env() {
   echo "Non-RHEL detected — preparing Ubuntu/Debian env for RHEL-style named setup..."
-  # Install bind9 + tools + rsyslog if we're on apt-based system
   if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -y || true
     apt-get install -y bind9 dnsutils rsyslog >/dev/null 2>&1 || true
   fi
-  # Make /var/named so your original script can drop zone files there
   mkdir -p /var/named
-  # Create a 'named' user/group so chown named:named works AND bind can run as it
   if ! id -u named >/dev/null 2>&1; then
     if ! getent group named >/dev/null 2>&1; then
       groupadd -r named || true
@@ -73,10 +70,8 @@ prep_ubuntu_named_env() {
     useradd -r -g named -s /usr/sbin/nologin -d /var/named named 2>/dev/null || true
   fi
   chown -R named:named /var/named 2>/dev/null || true
-  # Make bind9 service behave like 'named' with /etc/named.conf + /var/named
   if [ -f /etc/default/bind9 ]; then
     if grep -q '^OPTIONS=' /etc/default/bind9; then
-      # Append -u named -c /etc/named.conf if not already there
       if ! grep -q '-c /etc/named.conf' /etc/default/bind9; then
         sed -i 's/^OPTIONS="/OPTIONS="-u named -c \/etc\/named.conf /' /etc/default/bind9 || true
       fi
@@ -86,7 +81,6 @@ prep_ubuntu_named_env() {
   else
     echo 'OPTIONS="-u named -c /etc/named.conf"' > /etc/default/bind9
   fi
-  # Map named.service -> bind9.service so systemctl enable --now named works
   if command -v systemctl >/dev/null 2>&1; then
     if systemctl list-unit-files | grep -q '^bind9.service'; then
       if ! systemctl list-unit-files | grep -q '^named.service'; then
@@ -126,7 +120,6 @@ EOF
     created=1
     echo "Created local-iso-AppStream -> $mp/AppStream"
   fi
-  # fallback: repodata at root
   if [ $created -eq 0 ] && [ -d "$mp/repodata" ]; then
     cat > /etc/yum.repos.d/local-iso.repo <<EOF
 [local-iso]
@@ -139,13 +132,14 @@ EOF
     echo "Created fallback local-iso -> $mp"
   fi
   if [ $created -eq 1 ]; then
-    if command -v dnf >/dev/null 2>&1; then dnf makecache --refresh || true; elif command -v yum >/dev/null 2>&1; then yum makecache || true; fi
+    if command -v dnf >/dev/null 2>&1; then dnf makecache --refresh || true
+    elif command -v yum >/dev/null 2>&1; then yum makecache || true; fi
     return 0
   fi
   return 2
 }
 
-# On RHEL-like: ensure BaseOS+AppStream exist (try mounted ISOs first)
+# On RHEL-like: ensure BaseOS+AppStream exist
 if [ "$IS_RHEL" -eq 1 ]; then
   have_base=0; have_app=0
   if grep -riq "baseurl.*BaseOS" /etc/yum.repos.d 2>/dev/null; then have_base=1; fi
@@ -153,8 +147,7 @@ if [ "$IS_RHEL" -eq 1 ]; then
   if [ $have_base -eq 1 ] && [ $have_app -eq 1 ]; then
     echo "BaseOS and AppStream already present."
   else
-    echo "BaseOS/AppStream not found — attempting to configure from mounted ISO(s) (mandatory)."
-    # find iso9660 mounts
+    echo "BaseOS/AppStream not found — attempting to configure from mounted ISO(s)."
     mapfile -t MPS < <(mount | awk '/iso9660/ { for(i=3;i<=NF;i++){ if($i ~ /^\//){ print $i; break } } }' | sort -u)
     success=0
     for mp in "${MPS[@]}"; do
@@ -162,9 +155,8 @@ if [ "$IS_RHEL" -eq 1 ]; then
       echo "Checking mounted ISO at $mp ..."
       if create_repos_from_mount "$mp"; then success=1; break; fi
     done
-    # if no mounted ISO worked, search for ISO files and try mounting them
     if [ $success -eq 0 ]; then
-      echo "No mounted ISO provided usable repos — scanning for ISO files (shallow) ..."
+      echo "No mounted ISO provided usable repos — scanning for ISO files ..."
       CAND=""
       for p in /run/media /media /root /home /mnt /var/tmp /tmp; do
         [ -d "$p" ] || continue
@@ -175,12 +167,9 @@ if [ "$IS_RHEL" -eq 1 ]; then
       fi
       if [ -z "${CAND:-}" ]; then
         echo "ERROR: No RHEL-style ISO found on system and no mounted ISO provided. Cannot continue on RHEL-like host."
-        echo "Place a RHEL8-style DVD ISO on the system (e.g. /root/RHEL-8-dvd.iso) or mount the ISO and re-run."
         exit 1
       fi
-      MBASE="/mnt/local-iso"
-      mkdir -p "$MBASE"
-      idx=0
+      MBASE="/mnt/local-iso"; mkdir -p "$MBASE"; idx=0
       for iso in $CAND; do
         idx=$((idx+1)); mp="$MBASE/$idx"; mkdir -p "$mp"
         if mount -o loop,ro "$iso" "$mp" 2>/dev/null; then
@@ -198,7 +187,7 @@ if [ "$IS_RHEL" -eq 1 ]; then
   fi
 fi
 
-# helper: add server PTR if needed
+# helper: add server PTR if needed (safe $TTL)
 add_server_ptr() {
   local ip="$1" fqdn="$2" domain="$3"
   IFS='.' read -r a b c d <<<"$ip"
@@ -212,10 +201,9 @@ $TTL 86400
 @ IN NS __FQDN__.
 ; PTR records
 RZ
-    # Now replace placeholders with real values
-    sed -i "s/__FQDN__/${fqdn//\./\\.}/g" "$revfile"
-    sed -i "s/__DOMAIN__/${domain//\./\\.}/g" "$revfile"
-    sed -i "s/__SERIAL__/$(date +%Y%m%d)01/g" "$revfile"
+    sed -i "s/__FQDN__/${fqdn//./\\.}/g" "$revfile"
+    sed -i "s/__DOMAIN__/${domain//./\\.}/g" "$revfile"
+    sed -i "s/__SERIAL__/$(date +%Y%m%d)01/" "$revfile"
     chown named:named "$revfile" 2>/dev/null || true
   fi
   last="$d"
@@ -228,30 +216,34 @@ RZ
   fi
 }
 
-# Preserve original server installer block verbatim (for audit) and make executable
+# Preserve original server installer block and make executable
 cat > /usr/local/bin/setup-my-dns-and-logging-server.sh.orig_script_block <<'ORIG' && chmod +x /usr/local/bin/setup-my-dns-and-logging-server.sh.orig_script_block
 #!/bin/bash
 # merged server installer:
-# original DNS + rsyslog setup (untouched), plus admin blocking helper feature added at the end.
+# original DNS + rsyslog setup, plus admin blocking helper.
+
 IP="$1"
 FQDN="$2"
 DOMAIN="$3"
 [ -z "$IP" ] || [ -z "$FQDN" ] || [ -z "$DOMAIN" ] && {
     echo "Usage: sudo $0 <server-ip> <fqdn> <domain>"
-    echo "Example: sudo $0 192.168.29.206 server.cst.com cst.com"
+    echo "Example: sudo $0 10.231.133.110 srv.net.com net.com"
     exit 1
 }
-echo "Setting up DNS + Remote Syslog Server — MERGED VERSION (hostname logs + green + zero noise + admin-block)..."
+echo "Setting up DNS + Remote Syslog Server ..."
+
 # === FORCE TAKE PORT 514 ===
 echo "Force-killing anything using port 514..."
 for proto in udp tcp; do
-    ss -lpn "sport = :514" 2>/dev/null | awk '{print $6}' | grep -o 'pid=[0-9]+' | cut -d= -f2 | sort -u | xargs -r kill -9 2>/dev/null
+    ss -lpn "sport = :514" 2>/dev/null | awk '{print $6}' | grep -o 'pid=[0-9]\+' | cut -d= -f2 | sort -u | xargs -r kill -9 2>/dev/null
 done
 systemctl stop rsyslog syslog-ng auditd 2>/dev/null || true
 sleep 2
+
 # === DNS ===
-dnf install -y bind bind-utils &>/dev/null || true
+dnf install -y bind bind-utils &>/dev/null || yum install -y bind bind-utils &>/dev/null || true
 hostnamectl set-hostname "$FQDN"
+
 cat > /etc/named.conf <<EON
 options {
     listen-on port 53 { any; };
@@ -264,35 +256,35 @@ zone "$DOMAIN" { type master; file "$DOMAIN.zone"; };
 include "/etc/named.rfc1912.zones";
 include "/etc/named.root.key";
 EON
+
 cat > /var/named/$DOMAIN.zone <<'EOZ'
 $TTL 86400
 @ IN SOA __FQDN__. root.__DOMAIN__. ( __SERIAL__ 3H 1H 1W 1D )
 @ IN NS __FQDN__.
 __HOST__ IN A __IP__
 EOZ
-# Replace placeholders now
 sed -i "s/__FQDN__/${FQDN//./\\.}/g" /var/named/$DOMAIN.zone
 sed -i "s/__DOMAIN__/${DOMAIN//./\\.}/g" /var/named/$DOMAIN.zone
 sed -i "s/__HOST__/$(echo "$FQDN" | cut -d. -f1)/" /var/named/$DOMAIN.zone
 sed -i "s/__IP__/$IP/" /var/named/$DOMAIN.zone
 sed -i "s/__SERIAL__/$(date +%Y%m%d)01/" /var/named/$DOMAIN.zone
+
 chown -R named:named /var/named
-systemctl enable --now named
+systemctl enable --now named || systemctl restart named || true
 firewall-cmd --add-service=dns --permanent &>/dev/null || true
 firewall-cmd --reload &>/dev/null || true
-# === add-client.sh (FIXED VERSION) ===
+
+# === add-client.sh (simple A record) ===
 cat > /usr/local/bin/add-client.sh <<'ADD'
 #!/bin/bash
 NAME="$1"
 IP="$2"
 DOMAIN="${3:-}"
 ZONE_DIR="/var/named"
-# Validate inputs
 if [ -z "$NAME" ] || [ -z "$IP" ]; then
     echo "Usage: sudo $0 <name> <ip> [domain]"
     exit 1
 fi
-# Auto-detect domain if not passed
 if [ -z "$DOMAIN" ]; then
     shopt -s nullglob
     ZONES=("$ZONE_DIR"/*.zone)
@@ -308,19 +300,18 @@ if [ ! -f "$ZONE" ]; then
     echo "Zone file does not exist: $ZONE"
     exit 3
 fi
-# Add A record
 echo "$NAME IN A $IP" >> "$ZONE"
-# Fix SOA serial
 sed -i "/SOA/ s/[0-9]\{8,12\}/$(date +%Y%m%d)99/" "$ZONE"
-# Reload DNS zone
 rndc reload "$DOMAIN" &>/dev/null || true
 echo "Added → $NAME.$DOMAIN ($IP)"
 ADD
 chmod +x /usr/local/bin/add-client.sh
+
 # === FINAL RSYSLOG CONFIG ===
-dnf install -y rsyslog &>/dev/null || true
+dnf install -y rsyslog &>/dev/null || yum install -y rsyslog &>/dev/null || true
 mkdir -p /var/log/remote
 chmod 750 /var/log/remote
+
 cat > /etc/rsyslog.d/50-remote-logger.conf <<'RSYS'
 module(load="imuxsock")
 module(load="imjournal")
@@ -329,8 +320,10 @@ $UDPServerRun 514
 $ModLoad imtcp
 $InputTCPServerRun 514
 $PreserveFQDN on
+
 $template HostFile,"/var/log/remote/%hostname%.logs"
 $template GreenCmd,"\033[1;32m%timestamp:::date-rfc3339% %msg:F,58:2%@%hostname% %msg:R,ERE,0,FIELD:: (.*)--end%\033[0m\n"
+
 if $syslogtag == 'remote-cmd:' and $fromhost-ip != '127.0.0.1' and $fromhost-ip != '::1' then {
     action(type="omfile" dynaFile="HostFile" template="GreenCmd")
     stop
@@ -339,6 +332,7 @@ if $fromhost-ip != '127.0.0.1' and $fromhost-ip != '::1' then {
     action(type="omfile" dynaFile="HostFile")
 }
 RSYS
+
 cat > /etc/logrotate.d/remote-logs <<'LR'
 /var/log/remote/*.logs {
     daily
@@ -352,62 +346,103 @@ cat > /etc/logrotate.d/remote-logs <<'LR'
     endscript
 }
 LR
+
 firewall-cmd --add-port=514/tcp --add-port=514/udp --permanent &>/dev/null || true
 firewall-cmd --reload &>/dev/null || true
+
 [ "$(getenforce 2>/dev/null || echo Disabled)" = "Enforcing" ] && {
     semanage fcontext -a -t var_log_t '/var/log/remote(/.*)?' 2>/dev/null || true
     restorecon -R /var/log/remote 2>/dev/null || true
 }
 systemctl restart rsyslog
 systemctl enable --now rsyslog
+
 echo
 echo -e "\033[1;32mSERVER 100% READY!\033[0m"
 echo -e "\033[1;32mPort 514: FORCE OWNED\033[0m"
 echo -e "\033[1;32mLogs: /var/log/remote/<hostname>.logs\033[0m"
 echo
 echo "Add clients:"
-echo " sudo add-client.sh client1 192.168.29.210"
-echo " sudo add-client.sh db01 192.168.29.215"
+echo " sudo add-client.sh client1 10.231.133.120"
 echo
-# === ADMIN BLOCK HELPER (ADDED FEATURE) ===
+
+# === ADMIN BLOCK HELPER (NEW STRONG VERSION) ===
 cat > /usr/local/bin/admin-block-client.sh <<'AB'
 #!/usr/bin/env bash
-ACTION="$1"; IP="$2"; DROP_MARKER_DIR="/var/lib/admin-block-client"; mkdir -p "$DROP_MARKER_DIR"
-if [ -z "$ACTION" ] || [ -z "$IP" ]; then echo "Usage: sudo $0 <block|unblock|status> <client-ip>"; exit 2; fi
+set -euo pipefail
+
+ACTION="${1:-}"
+IP="${2:-}"
+DROP_MARKER_DIR="/var/lib/admin-block-client"
+mkdir -p "$DROP_MARKER_DIR"
+
+if [ -z "$ACTION" ] || [ -z "$IP" ]; then
+  echo "Usage: sudo $0 <block|unblock|status> <client-ip>"
+  exit 2
+fi
+
+# Decide whether to use firewalld or iptables
+use_firewalld=0
+if command -v firewall-cmd >/dev/null 2>&1; then
+  if firewall-cmd --state >/dev/null 2>&1; then
+    use_firewalld=1
+  fi
+fi
+
 case "$ACTION" in
   block)
-    if command -v firewall-cmd >/dev/null 2>&1; then
-      firewall-cmd --permanent --add-rich-rule="rule family='ipv4' source address='$IP' drop" >/dev/null 2>&1 || true
+    if [ "$use_firewalld" -eq 1 ]; then
+      firewall-cmd --add-rich-rule="rule family='ipv4' source address='${IP}' drop" >/dev/null 2>&1 || true
+      firewall-cmd --permanent --add-rich-rule="rule family='ipv4' source address='${IP}' drop" >/dev/null 2>&1 || true
       firewall-cmd --reload >/dev/null 2>&1 || true
     else
-      iptables -C INPUT -s "$IP" -j DROP >/dev/null 2>&1 || iptables -I INPUT -s "$IP" -j DROP 2>/dev/null || true
+      iptables  -C INPUT -s "$IP" -j DROP >/dev/null 2>&1 || iptables  -I INPUT -s "$IP" -j DROP 2>/dev/null || true
       ip6tables -C INPUT -s "$IP" -j DROP >/dev/null 2>&1 || ip6tables -I INPUT -s "$IP" -j DROP 2>/dev/null || true
     fi
-    touch "$DROP_MARKER_DIR/$IP.blocked"; echo "Blocked $IP";;
+    touch "$DROP_MARKER_DIR/$IP.blocked"
+    echo "Blocked $IP"
+    ;;
+
   unblock)
-    if command -v firewall-cmd >/dev/null 2>&1; then
-      firewall-cmd --permanent --remove-rich-rule="rule family='ipv4' source address='$IP' drop" >/dev/null 2>&1 || true
+    if [ "$use_firewalld" -eq 1 ]; then
+      firewall-cmd --remove-rich-rule="rule family='ipv4' source address='${IP}' drop" >/dev/null 2>&1 || true
+      firewall-cmd --permanent --remove-rich-rule="rule family='ipv4' source address='${IP}' drop" >/dev/null 2>&1 || true
       firewall-cmd --reload >/dev/null 2>&1 || true
     else
-      iptables -D INPUT -s "$IP" -j DROP 2>/dev/null || true
+      iptables  -D INPUT -s "$IP" -j DROP 2>/dev/null || true
       ip6tables -D INPUT -s "$IP" -j DROP 2>/dev/null || true
     fi
-    rm -f "$DROP_MARKER_DIR/$IP.blocked" 2>/dev/null || true; echo "Unblocked $IP";;
+    rm -f "$DROP_MARKER_DIR/$IP.blocked" 2>/dev/null || true
+    echo "Unblocked $IP"
+    ;;
+
   status)
-    [ -f "$DROP_MARKER_DIR/$IP.blocked" ] && echo "$IP is marked blocked" || echo "No marker for $IP"
-    if command -v firewall-cmd >/dev/null 2>&1; then
+    if [ -f "$DROP_MARKER_DIR/$IP.blocked" ]; then
+      echo "$IP is marked blocked (marker file present)"
+    else
+      echo "No marker file for $IP"
+    fi
+    if [ "$use_firewalld" -eq 1 ]; then
+      echo "Firewalld rich rules containing $IP:"
       firewall-cmd --list-rich-rules | grep "$IP" || true
     else
-      iptables -S | grep "$IP" || true
-    fi;;
-  *) echo "Unknown action"; exit 3;;
+      echo "iptables rules containing $IP:"
+      iptables  -S | grep "$IP" || true
+      ip6tables -S | grep "$IP" || true
+    fi
+    ;;
+
+  *)
+    echo "Unknown action: $ACTION"
+    exit 3
+    ;;
 esac
 AB
 chmod +x /usr/local/bin/admin-block-client.sh
 echo "Admin helper installed: /usr/local/bin/admin-block-client.sh"
 ORIG
 
-# run original installer block (unchanged logic)
+# run original installer block
 echo "Executing original installer block..."
 if [ "$IS_RHEL" -eq 1 ]; then
   /usr/local/bin/setup-my-dns-and-logging-server.sh.orig_script_block "$IP" "$FQDN" "$DOMAIN" || true
@@ -419,7 +454,7 @@ fi
 # ensure server PTR
 add_server_ptr "$IP" "$FQDN" "$DOMAIN" || true
 
-# place enhanced add-client (A+PTR)
+# enhanced add-client (A + PTR)
 cat > /usr/local/bin/add-client.sh <<'ADDCLIENT'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -465,3 +500,4 @@ chmod +x /usr/local/bin/add-client.sh
 echo "Server wrapper finished. See $LOG"
 exit 0
 SERVER_EOF
+chmod +x /usr/local/bin/setup-my-dns-and-logging-server.sh
